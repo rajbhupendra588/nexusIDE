@@ -53,6 +53,7 @@ import { HiddenItemStrategy, MenuWorkbenchToolBar } from '../../../../platform/a
 import { MenuId, MenuItemAction } from '../../../../platform/actions/common/actions.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { IContextKey, IContextKeyService } from '../../../../platform/contextkey/common/contextkey.js';
+import { ExtensionIdentifier } from '../../../../platform/extensions/common/extensions.js';
 import { IFileService } from '../../../../platform/files/common/files.js';
 import { registerAndCreateHistoryNavigationContext } from '../../../../platform/history/browser/contextScopedHistoryWidget.js';
 import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js';
@@ -61,6 +62,7 @@ import { IKeybindingService } from '../../../../platform/keybinding/common/keybi
 import { ILabelService } from '../../../../platform/label/common/label.js';
 import { WorkbenchList } from '../../../../platform/list/browser/listService.js';
 import { ILogService } from '../../../../platform/log/common/log.js';
+import { asJson, IRequestService } from '../../../../platform/request/common/request.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
 import { IThemeService } from '../../../../platform/theme/common/themeService.js';
 import { ISharedWebContentExtractorService } from '../../../../platform/webContentExtractor/common/webContentExtractor.js';
@@ -402,6 +404,7 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		@IAccessibilityService private readonly accessibilityService: IAccessibilityService,
 		@ILanguageModelsService private readonly languageModelsService: ILanguageModelsService,
 		@ILogService private readonly logService: ILogService,
+		@IRequestService private readonly requestService: IRequestService,
 		@IFileService private readonly fileService: IFileService,
 		@IEditorService private readonly editorService: IEditorService,
 		@IThemeService private readonly themeService: IThemeService,
@@ -767,8 +770,151 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		} else {
 			this.storageService.store('chat.cachedLanguageModels', models, StorageScope.APPLICATION, StorageTarget.MACHINE);
 		}
+
+		// If no models are available from providers, try to get local Ollama models
+		if (models.length === 0) {
+			// Start async fetch of Ollama models
+			this.loadOllamaModelsAsync();
+			// Return empty for now, will be updated when Ollama models are loaded
+			return [];
+		}
+
 		models.sort((a, b) => a.metadata.name.localeCompare(b.metadata.name));
 		return models.filter(entry => entry.metadata?.isUserSelectable && this.modelSupportedForDefaultAgent(entry));
+	}
+
+	private async loadOllamaModelsAsync(): Promise<void> {
+		try {
+			const ollamaModels = await this.getOllamaModels();
+			if (ollamaModels.length > 0) {
+				// Store the models in cache so they appear in the dropdown
+				this.storageService.store('chat.cachedLanguageModels', ollamaModels, StorageScope.APPLICATION, StorageTarget.MACHINE);
+				// Trigger a refresh of the model picker
+				this._onDidChangeCurrentLanguageModel.fire(ollamaModels[0]);
+			}
+		} catch (error) {
+			console.error('[Ollama] Failed to load models:', error);
+		}
+	}
+
+	private async getOllamaModels(): Promise<ILanguageModelChatMetadataAndIdentifier[]> {
+		const defaultExtension = new ExtensionIdentifier('ollama');
+		const models: ILanguageModelChatMetadataAndIdentifier[] = [];
+
+		try {
+			// Check if Ollama is available
+			const isAvailable = await this.checkOllamaAvailability();
+			if (!isAvailable) {
+				return models;
+			}
+
+			// Get available models from Ollama
+			const ollamaModels = await this.fetchOllamaModels();
+
+			ollamaModels.forEach((modelName, index) => {
+				const isDefault = index === 0; // First model is default
+				const vendor = this.getVendorFromModelName(modelName);
+				const family = this.getFamilyFromModelName(modelName);
+
+				models.push({
+					identifier: `ollama/${modelName}`,
+					metadata: {
+						extension: defaultExtension,
+						name: modelName,
+						id: modelName,
+						vendor: vendor,
+						version: this.getVersionFromModelName(modelName),
+						family: family,
+						isDefault: isDefault,
+						isUserSelectable: true,
+						capabilities: {
+							toolCalling: true,
+							agentMode: true,
+							vision: this.hasVisionCapability(modelName)
+						},
+						maxInputTokens: this.getMaxInputTokens(modelName),
+						maxOutputTokens: 4096,
+						statusIcon: { id: 'check' },
+						modelPickerCategory: { label: vendor, order: 1 }
+					}
+				});
+			});
+		} catch (error) {
+			console.error('[Ollama] Failed to get models:', error);
+		}
+
+		return models;
+	}
+
+	private async checkOllamaAvailability(): Promise<boolean> {
+		try {
+			const response = await this.requestService.request({
+				url: 'http://localhost:11434/api/tags',
+				type: 'GET'
+			}, CancellationToken.None);
+			return response.res.statusCode === 200;
+		} catch {
+			return false;
+		}
+	}
+
+	private async fetchOllamaModels(): Promise<string[]> {
+		try {
+			const response = await this.requestService.request({
+				url: 'http://localhost:11434/api/tags',
+				type: 'GET'
+			}, CancellationToken.None);
+
+			if (response.res.statusCode === 200) {
+				const data = await asJson<{ models: Array<{ name: string }> }>(response);
+				return data?.models?.map(model => model.name) || [];
+			}
+			return [];
+		} catch (error) {
+			console.error('[Ollama] Failed to fetch models:', error);
+			return [];
+		}
+	}
+
+	private getVendorFromModelName(modelName: string): string {
+		if (modelName.includes('llama')) { return 'Meta'; }
+		if (modelName.includes('mistral')) { return 'Mistral AI'; }
+		if (modelName.includes('codellama')) { return 'Meta'; }
+		if (modelName.includes('phi')) { return 'Microsoft'; }
+		if (modelName.includes('gemma')) { return 'Google'; }
+		if (modelName.includes('qwen')) { return 'Alibaba'; }
+		if (modelName.includes('deepseek')) { return 'DeepSeek'; }
+		return 'Ollama';
+	}
+
+	private getFamilyFromModelName(modelName: string): string {
+		if (modelName.includes('llama')) { return 'Llama'; }
+		if (modelName.includes('mistral')) { return 'Mistral'; }
+		if (modelName.includes('codellama')) { return 'CodeLlama'; }
+		if (modelName.includes('phi')) { return 'Phi'; }
+		if (modelName.includes('gemma')) { return 'Gemma'; }
+		if (modelName.includes('qwen')) { return 'Qwen'; }
+		if (modelName.includes('deepseek')) { return 'DeepSeek'; }
+		return 'Ollama';
+	}
+
+	private getVersionFromModelName(modelName: string): string {
+		// Extract version from model name (e.g., "llama3.1:8b" -> "3.1")
+		const versionMatch = modelName.match(/(\d+\.?\d*)/);
+		return versionMatch ? versionMatch[1] : '1.0';
+	}
+
+	private hasVisionCapability(modelName: string): boolean {
+		// Some models have vision capabilities
+		return modelName.includes('llava') || modelName.includes('vision') || modelName.includes('multimodal');
+	}
+
+	private getMaxInputTokens(modelName: string): number {
+		// Estimate token limits based on model size
+		if (modelName.includes(':7b') || modelName.includes(':8b')) { return 32000; }
+		if (modelName.includes(':13b') || modelName.includes(':14b')) { return 64000; }
+		if (modelName.includes(':70b') || modelName.includes(':72b')) { return 128000; }
+		return 32000; // Default
 	}
 
 	private setCurrentLanguageModelToDefault() {

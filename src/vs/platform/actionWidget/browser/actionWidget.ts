@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 import * as dom from '../../../base/browser/dom.js';
 import { ActionBar } from '../../../base/browser/ui/actionbar/actionbar.js';
-import { IAnchor } from '../../../base/browser/ui/contextview/contextview.js';
+import { AnchorAlignment, AnchorAxisAlignment, AnchorPosition, IAnchor } from '../../../base/browser/ui/contextview/contextview.js';
 import { IAction } from '../../../base/common/actions.js';
 import { KeyCode, KeyMod } from '../../../base/common/keyCodes.js';
 import { Disposable, DisposableStore, IDisposable, MutableDisposable } from '../../../base/common/lifecycle.js';
@@ -66,6 +66,9 @@ class ActionWidgetService extends Disposable implements IActionWidgetService {
 		const list = this._instantiationService.createInstance(ActionList, user, supportsPreview, items, delegate, accessibilityProvider);
 		this._contextViewService.showContextView({
 			getAnchor: () => anchor,
+			anchorAlignment: AnchorAlignment.LEFT,
+			anchorAxisAlignment: AnchorAxisAlignment.VERTICAL,
+			anchorPosition: AnchorPosition.ABOVE,
 			render: (container: HTMLElement) => {
 				visibleContext.set(true);
 				return this._renderWidget(container, list, actionBarActions ?? []);

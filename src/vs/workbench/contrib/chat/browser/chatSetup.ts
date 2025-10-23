@@ -9,7 +9,6 @@ import { IButton } from '../../../../base/browser/ui/button/button.js';
 import { Dialog, DialogContentsAlignment } from '../../../../base/browser/ui/dialog/dialog.js';
 import { WorkbenchActionExecutedClassification, WorkbenchActionExecutedEvent } from '../../../../base/common/actions.js';
 import { coalesce } from '../../../../base/common/arrays.js';
-import { timeout } from '../../../../base/common/async.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { Codicon } from '../../../../base/common/codicons.js';
 import { toErrorMessage } from '../../../../base/common/errorMessage.js';
@@ -45,12 +44,11 @@ import { IProgressService, ProgressLocation } from '../../../../platform/progres
 import { IQuickInputService } from '../../../../platform/quickinput/common/quickInput.js';
 import { Registry } from '../../../../platform/registry/common/platform.js';
 import { ITelemetryService, TelemetryLevel } from '../../../../platform/telemetry/common/telemetry.js';
-import { IWorkspaceTrustManagementService, IWorkspaceTrustRequestService } from '../../../../platform/workspace/common/workspaceTrust.js';
+import { IWorkspaceTrustRequestService } from '../../../../platform/workspace/common/workspaceTrust.js';
 import { IWorkbenchContribution } from '../../../common/contributions.js';
 import { IViewDescriptorService, ViewContainerLocation } from '../../../common/views.js';
 import { IActivityService, ProgressBadge } from '../../../services/activity/common/activity.js';
 import { AuthenticationSession, IAuthenticationService } from '../../../services/authentication/common/authentication.js';
-import { IWorkbenchEnvironmentService } from '../../../services/environment/common/environmentService.js';
 import { EnablementState, IWorkbenchExtensionEnablementService } from '../../../services/extensionManagement/common/extensionManagement.js';
 import { ExtensionUrlHandlerOverrideRegistry } from '../../../services/extensions/browser/extensionUrlHandler.js';
 import { IExtensionService, nullExtensionDescription } from '../../../services/extensions/common/extensions.js';
@@ -64,11 +62,9 @@ import { IExtension, IExtensionsWorkbenchService } from '../../extensions/common
 import { IChatAgentImplementation, IChatAgentRequest, IChatAgentResult, IChatAgentService } from '../common/chatAgents.js';
 import { ChatContextKeys } from '../common/chatContextKeys.js';
 import { ChatEntitlement, ChatEntitlementContext, ChatEntitlementRequests, ChatEntitlementService, IChatEntitlementService, isProUser } from '../../../services/chat/common/chatEntitlementService.js';
-import { ChatModel, ChatRequestModel, IChatRequestModel, IChatRequestVariableData } from '../common/chatModel.js';
+import { IChatRequestModel } from '../common/chatModel.js';
 import { ChatMode, IChatModeService } from '../common/chatModes.js';
-import { ChatRequestAgentPart, ChatRequestToolPart } from '../common/chatParserTypes.js';
 import { IChatProgress, IChatService } from '../common/chatService.js';
-import { IChatRequestToolEntry } from '../common/chatVariableEntries.js';
 import { ChatAgentLocation, ChatConfiguration, ChatModeKind } from '../common/constants.js';
 import { ILanguageModelsService } from '../common/languageModels.js';
 import { CHAT_CATEGORY, CHAT_OPEN_ACTION_ID, CHAT_SETUP_ACTION_ID, CHAT_SETUP_SUPPORT_ANONYMOUS_ACTION_ID } from './actions/chatActions.js';
@@ -80,6 +76,122 @@ import { ILanguageFeaturesService } from '../../../../editor/common/services/lan
 import { NewSymbolName, NewSymbolNameTriggerKind } from '../../../../editor/common/languages.js';
 import { ITextModel } from '../../../../editor/common/model.js';
 import { IRange } from '../../../../editor/common/core/range.js';
+import { IRequestService, asJson, isSuccess } from '../../../../platform/request/common/request.js';
+
+// Ollama Service Interface
+interface IOllamaService {
+	generateResponse(prompt: string, model?: string): Promise<string>;
+	getAvailableModels(): Promise<string[]>;
+	isAvailable(): Promise<boolean>;
+	preloadAllModels(): Promise<void>;
+}
+
+// Ollama Service Implementation
+class OllamaService implements IOllamaService {
+	private readonly baseUrl = 'http://localhost:11434';
+	private readonly defaultModel = 'llama3.1:8b';
+	private loadedModels = new Set<string>();
+
+	constructor(@IRequestService private readonly requestService: IRequestService) { }
+
+	async isAvailable(): Promise<boolean> {
+		try {
+			const response = await this.requestService.request({
+				url: `${this.baseUrl}/api/tags`,
+				type: 'GET'
+			}, CancellationToken.None);
+			return isSuccess(response);
+		} catch {
+			return false;
+		}
+	}
+
+	async getAvailableModels(): Promise<string[]> {
+		try {
+			const response = await this.requestService.request({
+				url: `${this.baseUrl}/api/tags`,
+				type: 'GET'
+			}, CancellationToken.None);
+
+			if (isSuccess(response)) {
+				const data = await asJson<{ models: Array<{ name: string }> }>(response);
+				return data?.models?.map(model => model.name) || [];
+			}
+			return [];
+		} catch (error) {
+			console.error('[Ollama] Failed to get available models:', error);
+			return [];
+		}
+	}
+
+	async generateResponse(prompt: string, model: string = this.defaultModel): Promise<string> {
+		try {
+			const response = await this.requestService.request({
+				url: `${this.baseUrl}/api/generate`,
+				type: 'POST',
+				data: JSON.stringify({
+					model: model,
+					prompt: prompt,
+					stream: false
+				}),
+				headers: {
+					'Content-Type': 'application/json'
+				}
+			}, CancellationToken.None);
+
+			if (isSuccess(response)) {
+				const data = await asJson<{ response: string }>(response);
+				return data?.response || '';
+			}
+			throw new Error(`Ollama API returned status ${response.res.statusCode}`);
+		} catch (error) {
+			throw new Error(`Failed to generate response from Ollama: ${error}`);
+		}
+	}
+
+	async preloadAllModels(): Promise<void> {
+		try {
+			const models = await this.getAvailableModels();
+			console.log(`[Ollama] Preloading ${models.length} models: ${models.join(', ')}`);
+
+			// Preload each model using the load endpoint (more efficient)
+			const preloadPromises = models.map(async (model) => {
+				try {
+					const response = await this.requestService.request({
+						url: `${this.baseUrl}/api/generate`,
+						type: 'POST',
+						data: JSON.stringify({
+							model: model,
+							prompt: 'Load model',
+							stream: false,
+							options: {
+								temperature: 0.1,
+								num_predict: 1
+							}
+						}),
+						headers: {
+							'Content-Type': 'application/json'
+						}
+					}, CancellationToken.None);
+
+					if (isSuccess(response)) {
+						this.loadedModels.add(model);
+						console.log(`[Ollama] Successfully preloaded model: ${model}`);
+					} else {
+						console.warn(`[Ollama] Failed to preload model ${model}: Status ${response.res.statusCode}`);
+					}
+				} catch (error) {
+					console.warn(`[Ollama] Failed to preload model ${model}:`, error);
+				}
+			});
+
+			await Promise.allSettled(preloadPromises);
+			console.log(`[Ollama] Model preloading complete. Loaded: ${this.loadedModels.size}/${models.length} models`);
+		} catch (error) {
+			console.error('[Ollama] Failed to preload models:', error);
+		}
+	}
+}
 
 const defaultChat = {
 	extensionId: product.defaultChatAgent?.extensionId ?? '',
@@ -145,7 +257,7 @@ class SetupAgent extends Disposable implements IChatAgentImplementation {
 					break;
 			}
 
-			return SetupAgent.doRegisterAgent(instantiationService, chatAgentService, id, `${defaultChat.provider.default.name} Copilot`, true, description, location, mode, context, controller);
+			return SetupAgent.doRegisterAgent(instantiationService, chatAgentService, id, `Ollama Local AI`, true, description, location, mode, context, controller);
 		});
 	}
 
@@ -196,7 +308,7 @@ class SetupAgent extends Disposable implements IChatAgentImplementation {
 			slashCommands: [],
 			disambiguation: [],
 			locations: [location],
-			metadata: { helpTextPrefix: SetupAgent.SETUP_NEEDED_MESSAGE },
+			metadata: { helpTextPrefix: new MarkdownString(localize('ollamaReadyMessage', "Ollama Local AI is ready to help you.")) },
 			description,
 			extensionId: nullExtensionDescription.identifier,
 			extensionVersion: undefined,
@@ -204,7 +316,7 @@ class SetupAgent extends Disposable implements IChatAgentImplementation {
 			extensionPublisherId: nullExtensionDescription.publisher
 		}));
 
-		const agent = disposables.add(instantiationService.createInstance(SetupAgent, context, controller, location));
+		const agent = disposables.add(instantiationService.createInstance(SetupAgent));
 		disposables.add(chatAgentService.registerAgentImplementation(id, agent));
 		if (mode === ChatModeKind.Agent) {
 			chatAgentService.updateAgent(id, { themeIcon: Codicon.tools });
@@ -213,27 +325,28 @@ class SetupAgent extends Disposable implements IChatAgentImplementation {
 		return { agent, disposable: disposables };
 	}
 
-	private static readonly SETUP_NEEDED_MESSAGE = new MarkdownString(localize('settingUpCopilotNeeded', "You need to set up GitHub Copilot and be signed in to use Chat."));
-	private static readonly TRUST_NEEDED_MESSAGE = new MarkdownString(localize('trustNeeded', "You need to trust this workspace to use Chat."));
 
 	private readonly _onUnresolvableError = this._register(new Emitter<void>());
 	readonly onUnresolvableError = this._onUnresolvableError.event;
 
-	private readonly pendingForwardedRequests = new Map<string, Promise<void>>();
 
 	constructor(
-		private readonly context: ChatEntitlementContext,
-		private readonly controller: Lazy<ChatSetupController>,
-		private readonly location: ChatAgentLocation,
 		@IInstantiationService private readonly instantiationService: IInstantiationService,
 		@ILogService private readonly logService: ILogService,
-		@IConfigurationService private readonly configurationService: IConfigurationService,
-		@ITelemetryService private readonly telemetryService: ITelemetryService,
-		@IWorkbenchEnvironmentService private readonly environmentService: IWorkbenchEnvironmentService,
-		@IWorkspaceTrustManagementService private readonly workspaceTrustManagementService: IWorkspaceTrustManagementService,
-		@IChatEntitlementService private readonly chatEntitlementService: IChatEntitlementService,
+		@IRequestService private readonly requestService: IRequestService,
 	) {
 		super();
+		// Preload all Ollama models when the agent is created
+		this.preloadOllamaModels();
+	}
+
+	private async preloadOllamaModels(): Promise<void> {
+		try {
+			const ollamaService = new OllamaService(this.requestService);
+			await ollamaService.preloadAllModels();
+		} catch (error) {
+			this.logService.warn('[Ollama] Failed to preload models during initialization:', error);
+		}
 	}
 
 	async invoke(request: IChatAgentRequest, progress: (parts: IChatProgress[]) => void): Promise<IChatAgentResult> {
@@ -249,26 +362,14 @@ class SetupAgent extends Disposable implements IChatAgentImplementation {
 	}
 
 	private async doInvoke(request: IChatAgentRequest, progress: (part: IChatProgress) => void, chatService: IChatService, languageModelsService: ILanguageModelsService, chatWidgetService: IChatWidgetService, chatAgentService: IChatAgentService, languageModelToolsService: ILanguageModelToolsService): Promise<IChatAgentResult> {
-		if (
-			!this.context.state.installed ||									// Extension not installed: run setup to install
-			this.context.state.disabled ||										// Extension disabled: run setup to enable
-			this.context.state.untrusted ||										// Workspace untrusted: run setup to ask for trust
-			this.context.state.entitlement === ChatEntitlement.Available ||		// Entitlement available: run setup to sign up
-			(
-				this.context.state.entitlement === ChatEntitlement.Unknown &&	// Entitlement unknown: run setup to sign in / sign up
-				!this.chatEntitlementService.anonymous							// unless anonymous access is enabled
-			)
-		) {
-			return this.doInvokeWithSetup(request, progress, chatService, languageModelsService, chatWidgetService, chatAgentService, languageModelToolsService);
-		}
-
+		// Always use Ollama for local LLM processing - no setup required
 		return this.doInvokeWithoutSetup(request, progress, chatService, languageModelsService, chatWidgetService, chatAgentService, languageModelToolsService);
 	}
 
 	private async doInvokeWithoutSetup(request: IChatAgentRequest, progress: (part: IChatProgress) => void, chatService: IChatService, languageModelsService: ILanguageModelsService, chatWidgetService: IChatWidgetService, chatAgentService: IChatAgentService, languageModelToolsService: ILanguageModelToolsService): Promise<IChatAgentResult> {
 		const requestModel = chatWidgetService.getWidgetBySessionId(request.sessionId)?.viewModel?.model.getRequests().at(-1);
 		if (!requestModel) {
-			this.logService.error('[chat setup] Request model not found, cannot redispatch request.');
+			this.logService.error('[chat setup] Request model not found, cannot process request.');
 			return {}; // this should not happen
 		}
 
@@ -277,327 +378,80 @@ class SetupAgent extends Disposable implements IChatAgentImplementation {
 			content: new MarkdownString(localize('waitingChat', "Getting chat ready...")),
 		});
 
-		await this.forwardRequestToCopilot(requestModel, progress, chatService, languageModelsService, chatAgentService, chatWidgetService, languageModelToolsService);
+		await this.processRequestWithOllama(requestModel, progress, chatService);
 
 		return {};
 	}
 
-	private async forwardRequestToCopilot(requestModel: IChatRequestModel, progress: (part: IChatProgress) => void, chatService: IChatService, languageModelsService: ILanguageModelsService, chatAgentService: IChatAgentService, chatWidgetService: IChatWidgetService, languageModelToolsService: ILanguageModelToolsService): Promise<void> {
+	private async processRequestWithOllama(requestModel: IChatRequestModel, progress: (part: IChatProgress) => void, chatService: IChatService): Promise<void> {
 		try {
-			await this.doForwardRequestToCopilot(requestModel, progress, chatService, languageModelsService, chatAgentService, chatWidgetService, languageModelToolsService);
-		} catch (error) {
-			progress({
-				kind: 'warning',
-				content: new MarkdownString(localize('copilotUnavailableWarning', "Failed to get a response. Please try again."))
-			});
-		}
-	}
+			const ollamaService = new OllamaService(this.requestService);
 
-	private async doForwardRequestToCopilot(requestModel: IChatRequestModel, progress: (part: IChatProgress) => void, chatService: IChatService, languageModelsService: ILanguageModelsService, chatAgentService: IChatAgentService, chatWidgetService: IChatWidgetService, languageModelToolsService: ILanguageModelToolsService): Promise<void> {
-		if (this.pendingForwardedRequests.has(requestModel.session.sessionId)) {
-			throw new Error('Request already in progress');
-		}
-
-		const forwardRequest = this.doForwardRequestToCopilotWhenReady(requestModel, progress, chatService, languageModelsService, chatAgentService, chatWidgetService, languageModelToolsService);
-		this.pendingForwardedRequests.set(requestModel.session.sessionId, forwardRequest);
-
-		try {
-			await forwardRequest;
-		} finally {
-			this.pendingForwardedRequests.delete(requestModel.session.sessionId);
-		}
-	}
-
-	private async doForwardRequestToCopilotWhenReady(requestModel: IChatRequestModel, progress: (part: IChatProgress) => void, chatService: IChatService, languageModelsService: ILanguageModelsService, chatAgentService: IChatAgentService, chatWidgetService: IChatWidgetService, languageModelToolsService: ILanguageModelToolsService): Promise<void> {
-		const widget = chatWidgetService.getWidgetBySessionId(requestModel.session.sessionId);
-		const modeInfo = widget?.input.currentModeInfo;
-
-		// We need a signal to know when we can resend the request to
-		// Copilot. Waiting for the registration of the agent is not
-		// enough, we also need a language/tools model to be available.
-
-		let agentReady = false;
-		let languageModelReady = false;
-		let toolsModelReady = false;
-
-		const whenAgentReady = this.whenAgentReady(chatAgentService, modeInfo?.kind)?.then(() => agentReady = true);
-		const whenLanguageModelReady = this.whenLanguageModelReady(languageModelsService, requestModel.modelId)?.then(() => languageModelReady = true);
-		const whenToolsModelReady = this.whenToolsModelReady(languageModelToolsService, requestModel)?.then(() => toolsModelReady = true);
-
-		if (whenLanguageModelReady instanceof Promise || whenAgentReady instanceof Promise || whenToolsModelReady instanceof Promise) {
-			const timeoutHandle = setTimeout(() => {
-				progress({
-					kind: 'progressMessage',
-					content: new MarkdownString(localize('waitingChat2', "Chat is almost ready...")),
-				});
-			}, 10000);
-
-			try {
-				const ready = await Promise.race([
-					timeout(this.environmentService.remoteAuthority ? 60000 /* increase for remote scenarios */ : 20000).then(() => 'timedout'),
-					this.whenDefaultAgentFailed(chatService).then(() => 'error'),
-					Promise.allSettled([whenLanguageModelReady, whenAgentReady, whenToolsModelReady])
-				]);
-
-				if (ready === 'error' || ready === 'timedout') {
-					let warningMessage: string;
-					if (ready === 'timedout') {
-						if (this.chatEntitlementService.anonymous) {
-							warningMessage = localize('chatTookLongWarningAnonymous', "Chat took too long to get ready. Please ensure that the extension `{0}` is installed and enabled.", defaultChat.chatExtensionId);
-						} else {
-							warningMessage = localize('chatTookLongWarning', "Chat took too long to get ready. Please ensure you are signed in to {0} and that the extension `{1}` is installed and enabled.", defaultChat.provider.default.name, defaultChat.chatExtensionId);
-						}
-					} else {
-						if (this.chatEntitlementService.anonymous) {
-							warningMessage = localize('chatFailedWarningAnonymous', "Chat failed to get ready. Please ensure that the extension `{0}` is installed and enabled.", defaultChat.chatExtensionId);
-						} else {
-							warningMessage = localize('chatFailedWarning', "Chat failed to get ready. Please ensure you are signed in to {0} and that the extension `{1}` is installed and enabled.", defaultChat.provider.default.name, defaultChat.chatExtensionId);
-						}
-					}
-
-					this.logService.warn(warningMessage, {
-						agentReady: whenAgentReady ? agentReady : undefined,
-						languageModelReady: whenLanguageModelReady ? languageModelReady : undefined,
-						toolsModelReady: whenToolsModelReady ? toolsModelReady : undefined
-					});
-
-					progress({
-						kind: 'warning',
-						content: new MarkdownString(warningMessage)
-					});
-
-					// This means Copilot is unhealthy and we cannot retry the
-					// request. Signal this to the outside via an event.
-					this._onUnresolvableError.fire();
-					return;
-				}
-			} finally {
-				clearTimeout(timeoutHandle);
-			}
-		}
-
-		await chatService.resendRequest(requestModel, {
-			...widget?.getModeRequestOptions(),
-			modeInfo,
-			userSelectedModelId: widget?.input.currentLanguageModel
-		});
-	}
-
-	private whenLanguageModelReady(languageModelsService: ILanguageModelsService, modelId: string | undefined): Promise<unknown> | void {
-		const hasModelForRequest = () => {
-			if (modelId) {
-				return !!languageModelsService.lookupLanguageModel(modelId);
-			}
-
-			for (const id of languageModelsService.getLanguageModelIds()) {
-				const model = languageModelsService.lookupLanguageModel(id);
-				if (model && model.isDefault) {
-					return true;
-				}
-			}
-
-			return false;
-		};
-
-		if (hasModelForRequest()) {
-			return;
-		}
-
-		return Event.toPromise(Event.filter(languageModelsService.onDidChangeLanguageModels, () => hasModelForRequest()));
-	}
-
-	private whenToolsModelReady(languageModelToolsService: ILanguageModelToolsService, requestModel: IChatRequestModel): Promise<unknown> | void {
-		const needsToolsModel = requestModel.message.parts.some(part => part instanceof ChatRequestToolPart);
-		if (!needsToolsModel) {
-			return; // No tools in this request, no need to check
-		}
-
-		// check that tools other than setup. and internal tools are registered.
-		for (const tool of languageModelToolsService.getTools()) {
-			if (tool.id.startsWith('copilot_')) {
-				return; // we have tools!
-			}
-		}
-
-		return Event.toPromise(Event.filter(languageModelToolsService.onDidChangeTools, () => {
-			for (const tool of languageModelToolsService.getTools()) {
-				if (tool.id.startsWith('copilot_')) {
-					return true; // we have tools!
-				}
-			}
-
-			return false; // no external tools found
-		}));
-	}
-
-	private whenAgentReady(chatAgentService: IChatAgentService, mode: ChatModeKind | undefined): Promise<unknown> | void {
-		const defaultAgent = chatAgentService.getDefaultAgent(this.location, mode);
-		if (defaultAgent && !defaultAgent.isCore) {
-			return; // we have a default agent from an extension!
-		}
-
-		return Event.toPromise(Event.filter(chatAgentService.onDidChangeAgents, () => {
-			const defaultAgent = chatAgentService.getDefaultAgent(this.location, mode);
-			return Boolean(defaultAgent && !defaultAgent.isCore);
-		}));
-	}
-
-	private async whenDefaultAgentFailed(chatService: IChatService): Promise<void> {
-		return new Promise<void>(resolve => {
-			chatService.activateDefaultAgent(this.location).catch(() => resolve());
-		});
-	}
-
-	private async doInvokeWithSetup(request: IChatAgentRequest, progress: (part: IChatProgress) => void, chatService: IChatService, languageModelsService: ILanguageModelsService, chatWidgetService: IChatWidgetService, chatAgentService: IChatAgentService, languageModelToolsService: ILanguageModelToolsService): Promise<IChatAgentResult> {
-		this.telemetryService.publicLog2<WorkbenchActionExecutedEvent, WorkbenchActionExecutedClassification>('workbenchActionExecuted', { id: CHAT_SETUP_ACTION_ID, from: 'chat' });
-
-		const widget = chatWidgetService.getWidgetBySessionId(request.sessionId);
-		const requestModel = widget?.viewModel?.model.getRequests().at(-1);
-
-		const setupListener = Event.runAndSubscribe(this.controller.value.onDidChange, (() => {
-			switch (this.controller.value.step) {
-				case ChatSetupStep.SigningIn:
-					progress({
-						kind: 'progressMessage',
-						content: new MarkdownString(localize('setupChatSignIn2', "Signing in to {0}...", ChatEntitlementRequests.providerId(this.configurationService) === defaultChat.provider.enterprise.id ? defaultChat.provider.enterprise.name : defaultChat.provider.default.name)),
-					});
-					break;
-				case ChatSetupStep.Installing:
-					progress({
-						kind: 'progressMessage',
-						content: new MarkdownString(localize('installingChat', "Getting chat ready...")),
-					});
-					break;
-			}
-		}));
-
-		let result: IChatSetupResult | undefined = undefined;
-		try {
-			result = await ChatSetup.getInstance(this.instantiationService, this.context, this.controller).run({
-				disableChatViewReveal: true, 																				// we are already in a chat context
-				forceAnonymous: this.chatEntitlementService.anonymous ? ChatSetupAnonymous.EnabledWithoutDialog : undefined	// only enable anonymous selectively
-			});
-		} catch (error) {
-			this.logService.error(`[chat setup] Error during setup: ${toErrorMessage(error)}`);
-		} finally {
-			setupListener.dispose();
-		}
-
-		// User has agreed to run the setup
-		if (typeof result?.success === 'boolean') {
-			if (result.success) {
-				if (result.dialogSkipped) {
-					widget?.clear(); // make room for the Chat welcome experience
-				} else if (requestModel) {
-					let newRequest = this.replaceAgentInRequestModel(requestModel, chatAgentService); 	// Replace agent part with the actual Copilot agent...
-					newRequest = this.replaceToolInRequestModel(newRequest); 							// ...then replace any tool parts with the actual Copilot tools
-
-					await this.forwardRequestToCopilot(newRequest, progress, chatService, languageModelsService, chatAgentService, chatWidgetService, languageModelToolsService);
-				}
-			} else {
+			// Check if Ollama is available
+			const isAvailable = await ollamaService.isAvailable();
+			if (!isAvailable) {
 				progress({
 					kind: 'warning',
-					content: new MarkdownString(localize('chatSetupError', "Chat setup failed."))
+					content: new MarkdownString(localize('ollamaUnavailableWarning', "Ollama is not available. Please ensure Ollama is running on localhost:11434"))
 				});
+				return;
 			}
-		}
 
-		// User has cancelled the setup
-		else {
+			// Get available models
+			const models = await ollamaService.getAvailableModels();
+			if (models.length === 0) {
+				progress({
+					kind: 'warning',
+					content: new MarkdownString(localize('noModelsWarning', "No models available in Ollama. Please install a model first."))
+				});
+				return;
+			}
+
+			// Use the first available model or default to llama3.1:8b
+			const selectedModel = models.includes('llama3.1:8b') ? 'llama3.1:8b' : models[0];
+
 			progress({
-				kind: 'markdownContent',
-				content: this.workspaceTrustManagementService.isWorkspaceTrusted() ? SetupAgent.SETUP_NEEDED_MESSAGE : SetupAgent.TRUST_NEEDED_MESSAGE
+				kind: 'progressMessage',
+				content: new MarkdownString(localize('generatingResponse', "Generating response with Ollama...")),
+			});
+
+			// Extract the user's message from the request
+			const userMessage = requestModel.message.text;
+			if (!userMessage) {
+				progress({
+					kind: 'warning',
+					content: new MarkdownString(localize('emptyMessageWarning', "No message to process."))
+				});
+				return;
+			}
+
+			// Generate response using Ollama
+			const response = await ollamaService.generateResponse(userMessage, selectedModel);
+
+			// Add the response to the chat session
+			chatService.addCompleteRequest(requestModel.session.sessionId, userMessage, undefined, 0, {
+				message: response,
+				result: {}
+			});
+
+			progress({
+				kind: 'progressMessage',
+				content: new MarkdownString(localize('responseGenerated', "Response generated successfully!")),
+			});
+
+		} catch (error) {
+			this.logService.error('[Ollama] Failed to process request:', error);
+			progress({
+				kind: 'warning',
+				content: new MarkdownString(localize('ollamaErrorWarning', "Failed to get a response from Ollama. Please try again."))
 			});
 		}
-
-		return {};
 	}
 
-	private replaceAgentInRequestModel(requestModel: IChatRequestModel, chatAgentService: IChatAgentService): IChatRequestModel {
-		const agentPart = requestModel.message.parts.find((r): r is ChatRequestAgentPart => r instanceof ChatRequestAgentPart);
-		if (!agentPart) {
-			return requestModel;
-		}
 
-		const agentId = agentPart.agent.id.replace(/setup\./, `${defaultChat.extensionId}.`.toLowerCase());
-		const githubAgent = chatAgentService.getAgent(agentId);
-		if (!githubAgent) {
-			return requestModel;
-		}
 
-		const newAgentPart = new ChatRequestAgentPart(agentPart.range, agentPart.editorRange, githubAgent);
 
-		return new ChatRequestModel({
-			session: requestModel.session as ChatModel,
-			message: {
-				parts: requestModel.message.parts.map(part => {
-					if (part instanceof ChatRequestAgentPart) {
-						return newAgentPart;
-					}
-					return part;
-				}),
-				text: requestModel.message.text
-			},
-			variableData: requestModel.variableData,
-			timestamp: Date.now(),
-			attempt: requestModel.attempt,
-			modeInfo: requestModel.modeInfo,
-			confirmation: requestModel.confirmation,
-			locationData: requestModel.locationData,
-			attachedContext: requestModel.attachedContext,
-			isCompleteAddedRequest: requestModel.isCompleteAddedRequest,
-		});
-	}
 
-	private replaceToolInRequestModel(requestModel: IChatRequestModel): IChatRequestModel {
-		const toolPart = requestModel.message.parts.find((r): r is ChatRequestToolPart => r instanceof ChatRequestToolPart);
-		if (!toolPart) {
-			return requestModel;
-		}
-
-		const toolId = toolPart.toolId.replace(/setup.tools\./, `copilot_`.toLowerCase());
-		const newToolPart = new ChatRequestToolPart(
-			toolPart.range,
-			toolPart.editorRange,
-			toolPart.toolName,
-			toolId,
-			toolPart.displayName,
-			toolPart.icon
-		);
-
-		const chatRequestToolEntry: IChatRequestToolEntry = {
-			id: toolId,
-			name: 'new',
-			range: toolPart.range,
-			kind: 'tool',
-			value: undefined
-		};
-
-		const variableData: IChatRequestVariableData = {
-			variables: [chatRequestToolEntry]
-		};
-
-		return new ChatRequestModel({
-			session: requestModel.session as ChatModel,
-			message: {
-				parts: requestModel.message.parts.map(part => {
-					if (part instanceof ChatRequestToolPart) {
-						return newToolPart;
-					}
-					return part;
-				}),
-				text: requestModel.message.text
-			},
-			variableData: variableData,
-			timestamp: Date.now(),
-			attempt: requestModel.attempt,
-			modeInfo: requestModel.modeInfo,
-			confirmation: requestModel.confirmation,
-			locationData: requestModel.locationData,
-			attachedContext: [chatRequestToolEntry],
-			isCompleteAddedRequest: requestModel.isCompleteAddedRequest,
-		});
-	}
 }
 
 
@@ -878,7 +732,7 @@ class ChatSetup {
 		}
 
 		if (this.context.state.entitlement === ChatEntitlement.Unknown || options?.forceSignInDialog) {
-			return localize('signIn', "Sign in to use GitHub Copilot");
+			//		return localize('signIn', "Sign in to use GitHub Copilot");
 		}
 
 		return localize('startUsing', "Start using GitHub Copilot");
